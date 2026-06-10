@@ -20,6 +20,7 @@ global client, and rewraps everything as a standard `.fantome` archive.
 - [Installation](#installation)
 - [Usage](#usage)
 - [Verbose diagnostics](#verbose)
+- [Cross-champion textures (white-box VFX)](#cross-champion)
 - [Limitations and future work](#limitations)
 
 ---
@@ -271,6 +272,8 @@ pip install zstandard xxhash pillow
 - `xxhash` — compute WAD path hashes. **Required.**
 - `pillow` — convert the JPEG preview to PNG for the `.fantome`. **Optional**; without it, the mod is
   built without a preview image.
+- `pyRitoFile` — re-serialize bins for the `--fix-cross-champion` pass. **Optional**; only needed if
+  you use that flag (`pip install pyRitoFile`).
 
 Then just keep `overthewall.py` somewhere on your path. There is nothing to build.
 
@@ -299,6 +302,7 @@ python overthewall.py /path/to/skins/ -o converted/
 | `--author AUTHOR` | Set the author field in `info.json`. |
 | `--no-split-vo` | Keep voice banks in the champion WAD instead of splitting them into a locale WAD. |
 | `--no-preview` | Skip embedding the splash preview image. |
+| `--fix-cross-champion` | Localize particle textures borrowed from other champions to host-local paths, fixing white-box VFX (requires `pyRitoFile`). |
 | `-v`, `--verbose` | Print detailed diagnostics (see below). |
 | `-q`, `--quiet` | Suppress all output (overrides `--verbose`). |
 
@@ -337,6 +341,7 @@ Done: 1/1 converted.
       .skl: 5 bundled, 0 from base game
       .skn: 5 bundled, 0 from base game
       .tex: 340 bundled, 0 from base game
+    cross-champion refs: 44 (44 bundled at FOREIGN paths -> white-box risk) from Yasuo:12, Annie:11, Anivia:10, Diana:9, Sett:1
 ```
 
 What to read from it:
@@ -351,6 +356,33 @@ What to read from it:
   that is the signal for a genuinely absent custom asset (e.g. a missing particle texture, the usual
   cause of white-box VFX). Missing base-game/shared references are reported as a plain count and are
   normal.
+- **cross-champion refs** — particle assets the skin borrows from *other* champions (see the section
+  below). This is reported in verbose, and as a one-line note in normal output, whenever present.
+
+---
+
+<a name="cross-champion"></a>
+## Cross-champion textures (white-box VFX)
+
+Many skins are "patchwork" builds whose effects reuse particles from other champions — a frost
+footstep from Diana, a slash trail from Yasuo, and so on. The packer bundles those borrowed textures
+**at their original foreign paths** (e.g. `ASSETS/Characters/Diana/Skins/Skin47/Particles/...`). The
+bytes are physically present in your champion WAD, so they don't show up as "missing" — but the game
+resolves a `Characters/Diana/...` asset from **Diana's** WAD, which isn't loaded unless a Diana is in
+the match. The particle therefore can't bind its texture and renders as a blank **white box / quad**.
+This is a render-level failure, not a missing file, which is why it survives the normal audit.
+
+The tool detects this automatically (counting references whose `Characters/<X>/` segment isn't the
+host champion) and reports it. Passing `--fix-cross-champion` resolves it: for every such texture it
+
+1. computes a host-local path (`ASSETS/Characters/<Host>/xport/<flattened-original-path>`),
+2. rewrites every reference in the bins to point at the new path (using `pyRitoFile` to re-serialize,
+   since changing a path's length shifts nested size fields a byte-patch can't), and
+3. re-adds the texture bytes under the new host-local hash.
+
+After the pass, those textures resolve from the host champion's own WAD — which is always loaded when
+that champion is played — so the effects render correctly. The detection itself needs no extra
+dependency; only the `--fix-cross-champion` rewrite requires `pyRitoFile`.
 
 ---
 
@@ -361,3 +393,6 @@ What to read from it:
 - **Conversion, not porting.** Skins built for an older patch may still crash; repairing them is manual bin work outside this tool's scope.
 - **Locale detection is voice-over only.** Only `VO/<locale>/` banks are split out; sound effects and other assets always go in the champion WAD (which is correct).
 - **Heuristic champion detection.** Detection is by majority vote over plaintext references, not a manifest lookup, so an unusually shared-asset-heavy skin could in principle mis-vote; the verbose tally exists to make that visible.
+- **Cross-champion fix is texture-scoped.** `--fix-cross-champion` localizes texture/particle assets
+  (`.tex/.dds/.scb/.sco`); it does not attempt to re-path other borrowed asset classes, which are
+  rarely the cause of visible breakage.
