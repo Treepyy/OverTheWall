@@ -166,6 +166,9 @@ _BANK_RE = re.compile(rb"ASSETS/Sounds/[ -~]+?\.(?:bnk|wpk)", re.IGNORECASE)
 _VO_LOCALE_RE = re.compile(r"/VO/([A-Za-z]{2}_[A-Za-z]{2})/", re.IGNORECASE)
 _ASSET_REF_RE = re.compile(
     rb"ASSETS/[ -~]+?\.(?:dds|tex|skn|skl|anm|bnk|wpk|scb|sco)", re.IGNORECASE)
+# a particle asset that belongs to ANOTHER champion's WAD (white-box risk)
+_CROSS_REF_RE = re.compile(
+    rb"ASSETS/Characters/([A-Za-z0-9]+)/[ -~]+?\.(?:tex|dds|scb|sco)", re.IGNORECASE)
 
 
 def _iter_decompressed(chunks, dctx):
@@ -272,6 +275,136 @@ def audit_references(chunks: list[Chunk]) -> tuple[dict[str, dict], str | None]:
     return by_ext, primary
 
 
+def cross_champion_refs(chunks: list[Chunk], host: str):
+    """Find texture/particle refs that point into ANOTHER champion's WAD.
+
+    These are the classic white-box culprit: the bytes may even be bundled, but
+    the game resolves them from <OtherChampion>.wad (not loaded unless that
+    champion is in the game), so they render as blank white quads. Returns
+    (refs, by_source_counter, n_bundled).
+    """
+    dctx = zstd.ZstdDecompressor()
+    present = {c.path_hash for c in chunks}
+    refs: set[str] = set()
+    for d in _iter_decompressed(chunks, dctx):
+        if d[:4] != b"PROP":
+            continue
+        for m in _CROSS_REF_RE.finditer(d):  # finditer -> need full match, not group
+            champ = m.group(1).decode()
+            if champ.lower() == host.lower():
+                continue
+            refs.add(m.group(0).decode("latin1"))
+    by_source = Counter(r.split("/")[2] for r in refs)
+    n_bundled = sum(1 for r in refs if xxh64(r) in present)
+    return refs, by_source, n_bundled
+
+
+def _localize_path(old: str, host: str) -> str:
+    """Map a foreign asset path to a collision-free host-local path that
+    resolves from the host champion's own WAD."""
+    after = old[len("ASSETS/Characters/"):]
+    return f"ASSETS/Characters/{host}/xport/" + after.replace("/", "_")
+
+
+def _replace_field_strings(field, mapping, counter):
+    """Recursively rewrite any string field whose value is a mapped path."""
+    data = getattr(field, "data", None)
+    if isinstance(data, str):
+        if data in mapping:
+            field.data = mapping[data]
+            counter[0] += 1
+    elif isinstance(data, list):
+        for i, it in enumerate(data):
+            if isinstance(it, str):
+                if it in mapping:
+                    data[i] = mapping[it]
+                    counter[0] += 1
+            else:
+                _replace_field_strings(it, mapping, counter)
+    elif isinstance(data, dict):
+        for k in list(data.keys()):
+            v = data[k]
+            if isinstance(v, str):
+                if v in mapping:
+                    data[k] = mapping[v]
+                    counter[0] += 1
+            else:
+                _replace_field_strings(v, mapping, counter)
+
+
+def localize_cross_champion(chunks: list[Chunk], host: str):
+    """Re-path every bundled cross-champion texture to a host-local path and
+    rewrite the references that point at it, so they resolve from the host WAD.
+
+    Needs pyRitoFile (pip install pyRitoFile) to safely re-serialize the bins,
+    since changing a path's length shifts nested size fields. Returns
+    (new_chunks, stats).
+    """
+    try:
+        import tempfile as _tf
+        from pyritofile import BIN
+    except ImportError:
+        raise RuntimeError(
+            "--fix-cross-champion requires the pyRitoFile package "
+            "(pip install pyRitoFile)")
+
+    refs, by_source, _ = cross_champion_refs(chunks, host)
+    present = {c.path_hash for c in chunks}
+    mapping = {r: _localize_path(r, host) for r in refs if xxh64(r) in present}
+    stats = {"refs": len(refs), "mapped": len(mapping), "rewritten": 0,
+             "aliased": 0, "by_source": by_source}
+    if not mapping:
+        return chunks, stats
+
+    cctx = zstd.ZstdCompressor(level=19)
+    dctx = zstd.ZstdDecompressor()
+    encoded = {k.encode("latin1") for k in mapping}
+    out: list[Chunk] = []
+    for c in chunks:
+        try:
+            d = decompress_chunk(c, dctx)
+        except Exception:
+            out.append(c)
+            continue
+        if d[:4] != b"PROP" or not any(k in d for k in encoded):
+            out.append(c)
+            continue
+        with _tf.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+            tf.write(d)
+            inp = tf.name
+        b = BIN()
+        b.read(inp)
+        os.unlink(inp)
+        cnt = [0]
+        for e in b.entries:
+            for f in e.data:
+                _replace_field_strings(f, mapping, cnt)
+        if cnt[0] == 0:
+            out.append(c)
+            continue
+        with _tf.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
+            outp = tf.name
+        b.write(outp)
+        nd = open(outp, "rb").read()
+        os.unlink(outp)
+        comp = cctx.compress(nd)
+        out.append(Chunk(c.path_hash, comp, len(comp), len(nd), 3,
+                        xxhash.xxh3_64(comp).intdigest()))
+        stats["rewritten"] += cnt[0]
+
+    # add the foreign textures back under their new host-local hashes
+    by_hash = {c.path_hash: c for c in chunks}
+    have = {c.path_hash for c in out}
+    for old, new in mapping.items():
+        oc = by_hash.get(xxh64(old))
+        nh = xxh64(new)
+        if oc and nh not in have:
+            out.append(Chunk(nh, oc.raw, oc.csize, oc.usize, oc.ctype, oc.checksum))
+            have.add(nh)
+            stats["aliased"] += 1
+    return out, stats
+
+
 # --------------------------------------------------------------------------- #
 # Output
 # --------------------------------------------------------------------------- #
@@ -322,7 +455,8 @@ def package_fantome(out_path, wads, info, preview):
 # Driver
 # --------------------------------------------------------------------------- #
 def convert(src_path, out_dir, *, name=None, author=None,
-            split_vo=True, want_preview=True, quiet=False, verbose=False):
+            split_vo=True, want_preview=True, fix_cross_champion=False,
+            quiet=False, verbose=False):
     def log(*a):
         if not quiet:
             print(*a)
@@ -359,6 +493,22 @@ def convert(src_path, out_dir, *, name=None, author=None,
             vlog(f"    {len(failed)} chunk(s) failed validation: "
                  + ", ".join(f"{h:016x}" for h in failed[:8])
                  + (" ..." if len(failed) > 8 else ""))
+
+    # cross-champion references (white-box risk) — detect, report, optionally fix
+    xrefs, xsrc, xbundled = cross_champion_refs(chunks, champ)
+    if xrefs:
+        srcs = ", ".join(f"{c}:{n}" for c, n in xsrc.most_common())
+        if verbose:
+            vlog(f"    cross-champion refs: {len(xrefs)} "
+                 f"({xbundled} bundled at FOREIGN paths -> white-box risk) "
+                 f"from {srcs}")
+        if fix_cross_champion:
+            chunks, st = localize_cross_champion(chunks, champ)
+            log(f"  fix-cross-champion: localized {st['mapped']} textures, "
+                f"rewrote {st['rewritten']} refs, added {st['aliased']} chunks")
+        else:
+            log(f"  note: {len(xrefs)} cross-champion VFX refs "
+                f"(white-box risk); re-run with --fix-cross-champion to localize")
 
     # split out locale voice banks
     locale_hashes: dict[str, set[int]] = {}
@@ -435,7 +585,7 @@ def gather_inputs(paths):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(
-        prog="lolgezi2fantome",
+        prog="overthewall",
         description="Convert WGZSkins (.lolgezi) custom skins to .fantome mods.")
     ap.add_argument("inputs", nargs="+",
                     help=".lolgezi file(s), or a folder to batch-convert")
@@ -447,6 +597,10 @@ def main(argv=None):
                     help="keep voice banks in the champion wad (don't split locale)")
     ap.add_argument("--no-preview", action="store_true",
                     help="skip embedding the splash preview image")
+    ap.add_argument("--fix-cross-champion", action="store_true",
+                    help="localize particle textures borrowed from other "
+                         "champions to host-local paths (fixes white-box VFX); "
+                         "requires the pyRitoFile package")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print detailed diagnostics (votes, chunk types, "
                          "voice banks, and a bundled-vs-missing reference audit)")
@@ -464,8 +618,9 @@ def main(argv=None):
         try:
             convert(f, args.output_dir, name=args.name if len(files) == 1 else None,
                     author=args.author, split_vo=not args.no_split_vo,
-                    want_preview=not args.no_preview, quiet=args.quiet,
-                    verbose=args.verbose)
+                    want_preview=not args.no_preview,
+                    fix_cross_champion=args.fix_cross_champion,
+                    quiet=args.quiet, verbose=args.verbose)
             ok += 1
         except Exception as e:
             print(f"  ! failed: {e}", file=sys.stderr)
